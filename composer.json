@@ -1,5 +1,5 @@
 {
-	"name": "keboola/csv",
+	"name": "laroo/keboola-csv",
 	"description": "Keboola CSV reader and writer",
 	"homepage": "http://keboola.com",
 	"autoload": {
