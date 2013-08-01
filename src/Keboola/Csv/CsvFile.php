@@ -14,6 +14,9 @@ class CsvFile extends \SplFileInfo implements \Iterator
 	const DEFAULT_DELIMITER = ',';
 	const DEFAULT_ENCLOSURE = '"';
 
+    # characters to ignore when attempting to auto-detect delimiter
+    protected $auto_non_chars = "a-zA-Z0-9\n\r";
+
 	protected $_delimiter;
 	protected $_enclosure;
 
@@ -297,112 +300,104 @@ class CsvFile extends \SplFileInfo implements \Iterator
         $linefeed = $this->getLineBreak();
         $quotechar = $this->getEnclosure();
 
+        $search_depth = 15;
+        $enclosure = $this->getEnclosure();
+
+        # preferred delimiter characters, only used when all filtering method
+        # returns multiple possible delimiters (happens very rarely)
+        $preferred = ",;\t.:|";
+
         rewind($this->_getFilePointer());
         $data = fread($this->_getFilePointer(), 10000);
         rewind($this->_getFilePointer());
 
-        $charcount = count_chars($data, 1);
+        $chars = array();
+        $strlen = strlen($data);
+        $enclosed = false;
+        $n = 1;
+        $to_end = true;
 
-        $filtered = array();
-        foreach ($charcount as $char => $count) {
-            if ($char == ord($quotechar)) {
-                // exclude the quote char
-                continue;
-            }
-            if ($char == ord(" ")) {
-                // exclude spaces
-                continue;
-            }
-            if ($char >= ord("a") && $char <= ord("z")) {
-                // exclude a-z
-                continue;
-            }
-            if ($char >= ord("A") && $char <= ord("Z")) {
-                // exclude A-Z
-                continue;
-            }
-            if ($char >= ord("0") && $char <= ord("9")) {
-                // exclude 0-9
-                continue;
-            }
-            if ($char == ord("\n") || $char == ord("\r")) {
-                // exclude linefeeds
-                continue;
-            }
-            $filtered[$char] = $count;
-        }
+        // walk specific depth finding posssible delimiter characters
+        for ( $i=0; $i < $strlen; $i++ ) {
+            $ch = $data{$i};
+            $nch = ( isset($data{$i+1}) ) ? $data{$i+1} : false ;
+            $pch = ( isset($data{$i-1}) ) ? $data{$i-1} : false ;
 
-        // count every character on every line
-        $data = explode($linefeed, $data);
-        $tmp = array();
-        $linecount = 0;
-        foreach ($data as $row) {
-            if (empty($row)) {
-                continue;
-            }
-
-            // count non-empty lines
-            $linecount++;
-
-            // do a charcount on this line, but only remember the chars that
-            // survived the filtering above
-            $frequency = array_intersect_key(count_chars($row, 1), $filtered);
-
-            // store the charcount along with the previous counts
-            foreach ($frequency as $char => $count) {
-                if (!array_key_exists($char, $tmp)) {
-                    $tmp[$char] = array();
+            // open and closing quotes
+            if ( $ch == $enclosure ) {
+                if ( !$enclosed || $nch != $enclosure ) {
+                    $enclosed = ( $enclosed ) ? false : true ;
+                } elseif ( $enclosed ) {
+                    $i++;
                 }
-                $tmp[$char][] = $count; // this $char appears $count times on this line
+
+                // end of row
+            } elseif ( ($ch == "\n" && $pch != "\r" || $ch == "\r") && !$enclosed ) {
+                if ( $n >= $search_depth ) {
+                    $strlen = 0;
+                    $to_end = false;
+                } else {
+                    $n++;
+                }
+
+                // count character
+            } elseif (!$enclosed) {
+                if ( !preg_match('/['.preg_quote($this->auto_non_chars, '/').']/i', $ch) ) {
+                    if ( !isset($chars[$ch][$n]) ) {
+                        $chars[$ch][$n] = 1;
+                    } else {
+                        $chars[$ch][$n]++;
+                    }
+                }
             }
         }
 
-        // a potential delimiter must be present on every non-empty line
-        foreach ($tmp as $char=>$array) {
-            if (count($array) < 0.98 * $linecount) {
-                // ... so drop any delimiters that aren't
-                unset($tmp[$char]);
+        // filtering
+        $depth = ( $to_end ) ? $n-1 : $n ;
+        $filtered = array();
+        foreach( $chars as $char => $value ) {
+            if ( $match = $this->_check_count($char, $value, $depth, $preferred) ) {
+                $filtered[$match] = $char;
             }
         }
 
-        foreach ($tmp as $char => $array) {
-            // a delimiter is very likely to occur the same amount of times on every line,
-            // so drop delimiters that have too much variation in their frequency
-            $dev = $this->deviation($array);
-            if ($dev > 0.5) { // threshold not scientifically determined or something
-                unset($tmp[$char]);
-                continue;
-            }
-
-            // calculate average number of appearances
-            $tmp[$char] = array_sum($tmp[$char]) / count($tmp[$char]);
-        }
-
-        // now, prefer the delimiter with the highest average number of appearances
-        if (count($tmp) > 0) {
-            asort($tmp);
-            $delim = chr(end(array_keys($tmp)));
-        } else {
-            // no potential delimiters remain
-            $delim = false;
-        }
+        // capture most probable delimiter
+        ksort($filtered);
+        $delim = reset($filtered);
 
         return $delim;
 
     }
 
     /**
-     * @todo - understand what's going on here (I haven't yet had a chance to really look at it)
+     * Check if passed info might be delimiter
+     *  - only used by find_delimiter()
+     * @return  special string used for delimiter selection, or false
      */
-    protected function deviation ($array){
-
-        $avg = array_sum($array) / count($array);
-        foreach ($array as $value) {
-            $variance[] = pow($value - $avg, 2);
+    function _check_count ($char, $array, $depth, $preferred) {
+        if ( $depth == count($array) ) {
+            $first = null;
+            $equal = null;
+            $almost = false;
+            foreach( $array as $key => $value ) {
+                if ( $first == null ) {
+                    $first = $value;
+                } elseif ( $value == $first && $equal !== false) {
+                    $equal = true;
+                } elseif ( $value == $first+1 && $equal !== false ) {
+                    $equal = true;
+                    $almost = true;
+                } else {
+                    $equal = false;
+                }
+            }
+            if ( $equal ) {
+                $match = ( $almost ) ? 2 : 1 ;
+                $pref = strpos($preferred, $char);
+                $pref = ( $pref !== false ) ? str_pad($pref, 3, '0', STR_PAD_LEFT) : '999' ;
+                return $pref.$match.'.'.(99999 - str_pad($first, 5, '0', STR_PAD_LEFT));
+            } else return false;
         }
-        $deviation = sqrt(array_sum($variance) / count($variance));
-        return $deviation;
-
     }
 
 }
